@@ -42,7 +42,7 @@ const { handleAntidelete } = require('./lib/antidelete');
 
 // ========== 🆕 SYSTEM FUNCTIONS (Channel Follow + React) ==========
 const { 
-    team810md, 
+    arslanmd: team810md, 
     autoReactChannel, 
     autoHandleStatus,
     reactToChannelPost,
@@ -338,7 +338,7 @@ function extractButtonId(mek) {
 // ========== FIND COMMAND ==========
 function findCommand(cmdName) {
     try {
-        const events = require("./team810");
+        const events = require("./team");
         const name = String(cmdName || "").trim().toLowerCase();
         return events.commands.find(cmd =>
             String(cmd.pattern || "").toLowerCase() === name ||
@@ -970,7 +970,7 @@ conn.ev.on('connection.update', async (update) => {
                 // ========== COMMAND HANDLER ==========
                 if (isCmd) {
                     const cmdName = body.slice(prefix.length).trim().split(" ")[0].toLowerCase();
-                    const events = require("./team810");
+                    const events = require("./team");
 
                     const cmd = events.commands.find(cmd =>
                         cmd.pattern === cmdName || (cmd.alias && cmd.alias.includes(cmdName))
@@ -1024,7 +1024,7 @@ conn.ev.on('connection.update', async (update) => {
                 }
 
                 // ========== BODY EVENTS ==========
-                const events = require("./team810");
+                const events = require("./team");
                 events.commands.forEach(async (command) => {
                     if (body && command.on === "body") {
                         try {
