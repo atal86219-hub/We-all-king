@@ -526,10 +526,16 @@ async function team810Pair(number, res = null) {
         const existingSession = await getSessionFromMongoDB(sanitizedNumber);
 
         if (!existingSession) {
-            team810Log(`No MongoDB session for ${sanitizedNumber} — new pairing required`, 'info');
-            if (fs.existsSync(sessionPath)) {
-                await fs.remove(sessionPath);
-                team810Log(`Cleaned leftover local session for ${sanitizedNumber}`, 'info');
+            // MongoDB is optional for the initial pairing. Baileys stores the
+            // live auth state in this local directory; deleting it whenever
+            // MongoDB is unavailable destroys the credentials after WhatsApp's
+            // 515 restart-required handshake and makes pairing loop forever.
+            const localCredsPath = path.join(sessionPath, 'creds.json');
+            if (await fs.pathExists(localCredsPath)) {
+                team810Log(`MongoDB has no saved session; preserving local WhatsApp credentials for ${sanitizedNumber}`, 'warning');
+            } else {
+                team810Log(`No saved MongoDB or local session for ${sanitizedNumber} — new pairing required`, 'info');
+                await fs.ensureDir(sessionPath);
             }
         } else {
             fs.ensureDirSync(sessionPath);
@@ -1118,6 +1124,8 @@ function setupAutoRestart(socket, number) {
                 socketCreationTime.delete(sanitizedNumber);
                 await deleteSessionFromMongoDB(sanitizedNumber);
                 await removeNumberFromMongoDB(sanitizedNumber);
+                const localSessionPath = path.join(__dirname, 'session', `session_${sanitizedNumber}`);
+                try { await fs.remove(localSessionPath); } catch (_) {}
                 socket.ev.removeAllListeners();
                 return;
             }
@@ -1125,14 +1133,19 @@ function setupAutoRestart(socket, number) {
             const isNormalError = statusCode === 408 || (errorMessage && errorMessage.includes('QR refs attempts ended'));
             if (isNormalError) { team810Log(`Normal closure for ${number}, no restart needed.`, 'info'); return; }
 
+            if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+                team810Log(`WhatsApp requested a protocol restart (515) for ${number}; keeping local auth credentials and creating a fresh socket.`, 'warning');
+            }
+
             if (restartAttempts < maxRestartAttempts) {
                 restartAttempts++;
-                team810Log(`Reconnecting ${number} (${restartAttempts}/${maxRestartAttempts}) in 10s...`, 'warning');
+                const restartDelay = (statusCode === DisconnectReason.restartRequired || statusCode === 515) ? 2000 : 10000;
+                team810Log(`Reconnecting ${number} (${restartAttempts}/${maxRestartAttempts}) in ${restartDelay / 1000}s without deleting auth files...`, 'warning');
                 const sanitizedNumber = number.replace(/[^0-9]/g, '');
                 activeSockets.delete(sanitizedNumber);
                 socketCreationTime.delete(sanitizedNumber);
                 socket.ev.removeAllListeners();
-                await delay(10000);
+                await delay(restartDelay);
                 try {
                     const mockRes = { headersSent: false, send: () => {}, status: () => mockRes, setHeader: () => {}, json: () => {} };
                     await team810Pair(number, mockRes);
@@ -1959,13 +1972,13 @@ setTimeout(async () => {
 // ============================================
 
 process.on('exit', () => {
+    // Keep Baileys auth files on persistent disks between graceful restarts.
+    // Render's ephemeral filesystem still requires MongoDB or a persistent disk.
     activeSockets.forEach((socket, number) => {
         try { socket.ws.close(); } catch (_) {}
         activeSockets.delete(number);
         socketCreationTime.delete(number);
     });
-    const sessionDir = path.join(__dirname, 'session');
-    if (fs.existsSync(sessionDir)) fs.emptyDirSync(sessionDir);
 });
 
 process.on('uncaughtException', (err) => {

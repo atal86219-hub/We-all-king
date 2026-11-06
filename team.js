@@ -19,6 +19,7 @@ function cmd(info, func) {
 
 module.exports = {
     cmd,
+    arslan: cmd,
     AddCommand: cmd,
     Function: cmd,
     commands,
