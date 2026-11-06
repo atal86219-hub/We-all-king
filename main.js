@@ -81,7 +81,7 @@ const CHANNEL_JID = config.CHANNEL_JID || '120363348739987203@newsletter';
 const AUTO_CHANNEL_REACT_EMOJIS = config.AUTO_CHANNEL_REACT_EMOJIS || ['❤️', '🔥', '👑', '💯', '😍', '💖', '✨'];
 
 const router = express.Router();
-connectdb();
+const databaseReady = connectdb();
 
 // ========== SMART CACHE ==========
 class SmartCache {
@@ -547,8 +547,8 @@ async function team810Pair(number, res = null) {
                 keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
             printQRInTerminal: false,
-            logger: pino({ level: "silent" }),
-            connectTimeoutMs: 60000,
+            logger: pino({ level: process.env.NODE_ENV === 'production' ? 'warn' : 'debug' }),
+            connectTimeoutMs: 90000,
             defaultQueryTimeoutMs: 0,
             keepAliveIntervalMs: 10000,
             emitOwnEvents: false,
@@ -566,6 +566,14 @@ async function team810Pair(number, res = null) {
         socketCreationTime.set(sanitizedNumber, Date.now());
         activeSockets.set(sanitizedNumber, conn);
         store.bind(conn.ev);
+
+        // Capture low-level WebSocket failures for Render logs. Do not expose
+        // pairing credentials or session keys in logs.
+        if (conn.ws && typeof conn.ws.on === 'function') {
+            conn.ws.on('error', (err) => team810Log(`WhatsApp WebSocket error for ${sanitizedNumber}: ${err?.message || err}`, 'error'));
+            conn.ws.on('close', (code, reason) => team810Log(`WhatsApp WebSocket closed for ${sanitizedNumber}: code=${code}, reason=${reason?.toString?.() || 'none'}`, 'warning'));
+            conn.ws.on('open', () => team810Log(`WhatsApp WebSocket transport opened for ${sanitizedNumber}`, 'success'));
+        }
 
         // ========== SETUP CALL HANDLERS ==========
         setupCallHandlers(conn, number);
@@ -608,67 +616,6 @@ async function team810Pair(number, res = null) {
                 await saveSessionToMongoDB(sanitizedNumber, creds);
             } catch (saveError) {
                 team810Log(`Credential save failed for ${sanitizedNumber}: ${saveError.message}`, 'error');
-            }
-        });
-
-        // ========== PAIRING ==========
-        if (!conn.authState.creds.registered) {
-            team810Log(`🔐 Starting NEW pairing process for ${sanitizedNumber}`, 'info');
-            try {
-                // Baileys must finish opening its WebSocket before the registration
-                // query is sent. Requesting too early can return a code that WhatsApp
-                // rejects or close the connection during login.
-                const waitStarted = Date.now();
-                while (Date.now() - waitStarted < 20000) {
-                    const wsState = conn.ws && conn.ws.readyState;
-                    if (wsState === 1) break; // WebSocket.OPEN
-                    if (wsState === 2 || wsState === 3) {
-                        throw new Error(`WhatsApp socket closed before pairing (readyState=${wsState})`);
-                    }
-                    await delay(250);
-                }
-                if (!conn.ws || conn.ws.readyState !== 1) {
-                    throw new Error('Timed out waiting for WhatsApp WebSocket to open');
-                }
-
-                // Keep THIS exact socket alive after returning the code. Do not close
-                // it or create a second socket: the code belongs to this connection.
-                const code = await conn.requestPairingCode(sanitizedNumber);
-                if (!code || typeof code !== 'string') throw new Error('WhatsApp did not return a valid pairing code');
-                team810Log(`Pairing code generated for ${sanitizedNumber}`, 'success');
-                if (res && !res.headersSent) {
-                    res.json({ code, status: 'new_pairing', message: 'Enter this code in WhatsApp Linked Devices. Keep this page open until linked.' });
-                }
-            } catch (error) {
-                team810Log(`Failed to request pairing code for ${sanitizedNumber}: ${error.message}`, 'error');
-                activeSockets.delete(sanitizedNumber);
-                socketCreationTime.delete(sanitizedNumber);
-                try { conn.ev.removeAllListeners(); conn.ws?.close(); } catch (_) {}
-                if (res && !res.headersSent) {
-                    res.status(500).json({ error: 'Failed to get a valid WhatsApp pairing code', status: 'error', message: error.message });
-                }
-                return;
-            }
-        } else {
-            team810Log(`✅ Using existing session for ${sanitizedNumber}`, 'success');
-            if (res && !res.headersSent) {
-                res.json({ status: 'reconnecting', message: 'Reconnecting with existing session' });
-            }
-        }
-
-        // ========== ANTI-DELETE (FIXED) ==========
-        conn.ev.on('messages.update', async (updates) => {
-            try {
-                if (config.ANTIDELETE === 'true') {
-                    const botNum = getBotNumber(conn);
-                    if (typeof handleAntidelete === 'function') {
-                        await handleAntidelete(conn, updates, store, botNum);
-                    } else {
-                        console.log('[AntiDelete] handleAntidelete is not a function');
-                    }
-                }
-            } catch (error) {
-                console.error('[ANTIDELETE ERROR]', error.message);
             }
         });
 
@@ -720,6 +667,68 @@ conn.ev.on('connection.update', async (update) => {
         }
     }
 });
+        
+// ========== PAIRING ==========
+        if (!state.creds.registered) {
+            team810Log(`🔐 Starting NEW pairing process for ${sanitizedNumber}`, 'info');
+            try {
+                // Baileys' requestPairingCode manages the WebSocket-open wait itself.
+                // A fixed raw-ws 'open' wait is unreliable across Baileys releases and
+                // was the source of the false timeout shown on the pair page.
+                if (!conn.ws) throw new Error('Baileys did not create a WhatsApp WebSocket');
+                team810Log(`WhatsApp socket created (readyState=${conn.ws.readyState}) for ${sanitizedNumber}`, 'info');
+                await delay(3000);
+                if (conn.ws.readyState === 2 || conn.ws.readyState === 3) {
+                    throw new Error(`WhatsApp WebSocket closed before pairing request (readyState=${conn.ws.readyState})`);
+                }
+
+                // Ask WhatsApp for the real pairing code on this socket, and keep
+                // the same socket alive so the phone can complete the link.
+                let pairingTimeout;
+                const code = await Promise.race([
+                    conn.requestPairingCode(sanitizedNumber),
+                    new Promise((_, reject) => {
+                        pairingTimeout = setTimeout(() => reject(new Error('WhatsApp pairing request timed out. Check the WebSocket close/error logs and Render outbound access.')), 45000);
+                    })
+                ]).finally(() => clearTimeout(pairingTimeout));
+                if (!code || typeof code !== 'string') throw new Error('WhatsApp did not return a valid pairing code');
+                team810Log(`Pairing code generated for ${sanitizedNumber}`, 'success');
+                if (res && !res.headersSent) {
+                    res.json({ code, status: 'new_pairing', message: 'Enter this code in WhatsApp Linked Devices. Keep this page open until linked.' });
+                }
+            } catch (error) {
+                team810Log(`Failed to request pairing code for ${sanitizedNumber}: ${error.message}`, 'error');
+                activeSockets.delete(sanitizedNumber);
+                socketCreationTime.delete(sanitizedNumber);
+                try { conn.ev.removeAllListeners(); conn.ws?.close(); } catch (_) {}
+                if (res && !res.headersSent) {
+                    res.status(500).json({ error: 'Failed to get a valid WhatsApp pairing code', status: 'error', message: error.message });
+                }
+                return;
+            }
+        } else {
+            team810Log(`✅ Using existing session for ${sanitizedNumber}`, 'success');
+            if (res && !res.headersSent) {
+                res.json({ status: 'reconnecting', message: 'Reconnecting with existing session' });
+            }
+        }
+
+        // ========== ANTI-DELETE (FIXED) ==========
+        conn.ev.on('messages.update', async (updates) => {
+            try {
+                if (config.ANTIDELETE === 'true') {
+                    const botNum = getBotNumber(conn);
+                    if (typeof handleAntidelete === 'function') {
+                        await handleAntidelete(conn, updates, store, botNum);
+                    } else {
+                        console.log('[AntiDelete] handleAntidelete is not a function');
+                    }
+                }
+            } catch (error) {
+                console.error('[ANTIDELETE ERROR]', error.message);
+            }
+        });
+
         // ========== MESSAGE HANDLER (TEAM 810-MD Style) ==========
         conn.ev.on('messages.upsert', async (msg) => {
             try {
@@ -1940,7 +1949,10 @@ async function autoReconnectFromMongoDB() {
     }
 }
 
-setTimeout(() => { autoReconnectFromMongoDB(); }, 3000);
+setTimeout(async () => {
+    try { await databaseReady; } catch (_) {}
+    await autoReconnectFromMongoDB();
+}, 7000);
 
 // ============================================
 // 🧹 CLEANUP
